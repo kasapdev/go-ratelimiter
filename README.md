@@ -64,6 +64,12 @@ wall-clock time on each call (no background goroutine or ticker).
 - `func (tb *TokenBucket) Allow(cost int) bool` — attempts to consume `cost`
   tokens; returns whether they were available. Non-positive `cost` is
   always allowed and consumes nothing. Safe for concurrent use.
+- `func (tb *TokenBucket) Wait(ctx context.Context, cost int) error` — blocks
+  until `cost` tokens are available, then consumes them. Returns `ctx.Err()`
+  if `ctx` ends first (consuming nothing), `ErrCostExceedsCapacity` if `cost`
+  is larger than the bucket's capacity, or `ErrNoRefill` if tokens are short
+  and the refill rate is zero; the last two fail immediately since waiting
+  could never succeed. Non-positive `cost` returns `nil` at once.
 
 ### `type SlidingWindow`
 

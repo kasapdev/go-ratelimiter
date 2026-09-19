@@ -1,6 +1,8 @@
 package ratelimiter
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -133,5 +135,108 @@ func TestTokenBucket_ConcurrentAllow(t *testing.T) {
 	}
 	if successCount > capacity {
 		t.Fatalf("successCount = %d exceeds capacity %d: mutex failed to prevent overcounting", successCount, capacity)
+	}
+}
+
+func TestTokenBucket_Wait_ImmediateWhenTokensAvailable(t *testing.T) {
+	tb := NewTokenBucket(3, 1)
+	start := time.Now()
+	if err := tb.Wait(context.Background(), 2); err != nil {
+		t.Fatalf("Wait returned %v, want nil", err)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("Wait should not block when tokens are available")
+	}
+	if !tb.Allow(1) || tb.Allow(1) {
+		t.Fatal("Wait(2) should have left exactly 1 token")
+	}
+}
+
+func TestTokenBucket_Wait_BlocksUntilRefilled(t *testing.T) {
+	tb := NewTokenBucket(1, 100) // one token every 10ms
+	if !tb.Allow(1) {
+		t.Fatal("bucket should start full")
+	}
+	start := time.Now()
+	if err := tb.Wait(context.Background(), 1); err != nil {
+		t.Fatalf("Wait returned %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed < 5*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("Wait blocked for %v, want roughly 10ms", elapsed)
+	}
+}
+
+func TestTokenBucket_Wait_ContextTimeoutConsumesNothing(t *testing.T) {
+	tb := NewTokenBucket(2, 0.01) // a token every 100s: effectively never
+	tb.Allow(1)                   // 1 token left
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	err := tb.Wait(ctx, 2)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait returned %v, want DeadlineExceeded", err)
+	}
+	if !tb.Allow(1) {
+		t.Fatal("a failed Wait must not consume tokens")
+	}
+}
+
+func TestTokenBucket_Wait_ContextAlreadyCanceled(t *testing.T) {
+	tb := NewTokenBucket(1, 0.01)
+	tb.Allow(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := tb.Wait(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait returned %v, want Canceled", err)
+	}
+}
+
+func TestTokenBucket_Wait_ImpossibleRequestsFailFast(t *testing.T) {
+	tb := NewTokenBucket(2, 1)
+	if err := tb.Wait(context.Background(), 3); !errors.Is(err, ErrCostExceedsCapacity) {
+		t.Fatalf("cost > capacity: got %v, want ErrCostExceedsCapacity", err)
+	}
+
+	frozen := NewTokenBucket(1, 0)
+	frozen.Allow(1)
+	if err := frozen.Wait(context.Background(), 1); !errors.Is(err, ErrNoRefill) {
+		t.Fatalf("zero refill: got %v, want ErrNoRefill", err)
+	}
+}
+
+func TestTokenBucket_Wait_NonPositiveCostIsNoop(t *testing.T) {
+	tb := NewTokenBucket(1, 0)
+	tb.Allow(1)
+	if err := tb.Wait(context.Background(), 0); err != nil {
+		t.Fatalf("Wait(0) = %v, want nil", err)
+	}
+	if err := tb.Wait(context.Background(), -5); err != nil {
+		t.Fatalf("Wait(-5) = %v, want nil", err)
+	}
+}
+
+func TestTokenBucket_Wait_ConcurrentWaitersNeverOverConsume(t *testing.T) {
+	tb := NewTokenBucket(1, 200) // 5ms per token
+	tb.Allow(1)
+	const waiters = 4
+	var done atomic.Int32
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < waiters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := tb.Wait(context.Background(), 1); err == nil {
+				done.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if done.Load() != waiters {
+		t.Fatalf("%d/%d waiters succeeded", done.Load(), waiters)
+	}
+	// 4 tokens at 200/s cannot be produced in much less than ~20ms.
+	if elapsed := time.Since(start); elapsed < 10*time.Millisecond {
+		t.Fatalf("waiters finished in %v: tokens were over-consumed", elapsed)
 	}
 }
