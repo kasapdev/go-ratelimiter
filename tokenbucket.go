@@ -1,8 +1,22 @@
 package ratelimiter
 
 import (
+	"context"
+	"errors"
+	"math"
 	"sync"
 	"time"
+)
+
+var (
+	// ErrCostExceedsCapacity is returned by Wait when the requested cost is
+	// larger than the bucket's capacity, so no amount of waiting could ever
+	// satisfy it.
+	ErrCostExceedsCapacity = errors.New("ratelimiter: cost exceeds bucket capacity")
+
+	// ErrNoRefill is returned by Wait when the bucket does not currently hold
+	// enough tokens and its refill rate is zero, so it never will.
+	ErrNoRefill = errors.New("ratelimiter: bucket has a zero refill rate and too few tokens")
 )
 
 // TokenBucket is a thread-safe token-bucket rate limiter. It holds up to
@@ -85,4 +99,55 @@ func (tb *TokenBucket) refillLocked(now time.Time) {
 		return
 	}
 	tb.tokens = min(tb.capacity, tb.tokens+elapsed*tb.refillRate)
+}
+
+// Wait blocks until cost tokens are available, then consumes them and returns
+// nil. It is the blocking counterpart of Allow, meant for callers that would
+// rather be paced than rejected.
+//
+// Wait returns early, consuming nothing, with:
+//   - ctx.Err() if ctx is canceled or its deadline passes while waiting;
+//   - ErrCostExceedsCapacity if cost is larger than the bucket's capacity;
+//   - ErrNoRefill if tokens are short and the refill rate is zero.
+//
+// The last two are reported immediately rather than blocking until ctx ends,
+// because waiting could never succeed. A non-positive cost returns nil
+// straight away, like Allow. Waiters are not served in strict FIFO order.
+//
+// Wait is safe for concurrent use by multiple goroutines.
+func (tb *TokenBucket) Wait(ctx context.Context, cost int) error {
+	if cost <= 0 {
+		return nil
+	}
+	c := float64(cost)
+
+	for {
+		tb.mu.Lock()
+		if c > tb.capacity {
+			tb.mu.Unlock()
+			return ErrCostExceedsCapacity
+		}
+		tb.refillLocked(time.Now())
+		if c <= tb.tokens {
+			tb.tokens -= c
+			tb.mu.Unlock()
+			return nil
+		}
+		if tb.refillRate == 0 {
+			tb.mu.Unlock()
+			return ErrNoRefill
+		}
+		missing := c - tb.tokens
+		wait := time.Duration(math.Ceil(missing / tb.refillRate * float64(time.Second)))
+		tb.mu.Unlock()
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+			// Re-check under the lock: another goroutine may have taken the tokens.
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
 }
